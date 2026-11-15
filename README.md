@@ -11,8 +11,8 @@
 3.11 или новее; проверено на Python 3.14.7.
 
 ```sh
-git clone https://github.com/zhupanovdm/food-log.git
-cd food-log
+git clone https://github.com/zhupanovdm/food-blogger-bot.git
+cd food-blogger-bot
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.lock.txt
 ```
