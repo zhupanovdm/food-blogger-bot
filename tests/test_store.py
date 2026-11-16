@@ -37,6 +37,27 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(a, b)
         self.assertEqual(len(self.db.photos(a)), 1)
 
+    def test_daily_meals_preserve_chronology_categories_and_local_midnight(self):
+        now = datetime(2026, 11, 16, 22, tzinfo=timezone.utc)
+        stamps = [int(datetime(2026, 11, 16, hour, tzinfo=timezone.utc).timestamp())
+                  for hour in (23, 21, 20)]
+        for index, stamp in enumerate(stamps):
+            meal = self.db.add_photo(photo(mid=50+index, stamp=stamp), now=0)
+            assessment = result(100+index)
+            assessment.category = "Перекус"
+            self.db.finish(meal, assessment, "text")
+        # Correction keeps the original source time and previous assessment.
+        self.db.add_note(2, 100, "съел половину", now=10)
+        days = self.db.daily(now, 8)
+        today = days[-1]
+        self.assertEqual(today["timezone"], "Europe/Moscow")
+        self.assertEqual([m["totals"]["kcal"] for m in today["meals"]], [101, 100])
+        self.assertEqual([m["meal"] for m in today["meals"]], ["Перекус", "Перекус"])
+        self.assertEqual(today["pending"], 1)
+        self.assertEqual(today["totals"]["kcal"], 201)
+        self.assertEqual(days[-2]["totals"]["kcal"], 102)
+        self.assertEqual(len(days[:-1]), 7)
+
     def test_album_keeps_all_captions_and_one_meal(self):
         a = self.db.add_photo(photo(album="a"), now=0)
         b = self.db.add_photo(photo(mid=11, album="a", caption="без масла"), now=1)

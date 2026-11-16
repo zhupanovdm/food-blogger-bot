@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from food_log.service import Config, Service, OpenAIAnalyzer, TelegramAPI
 from food_log.store import Store
@@ -153,13 +153,13 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("2200 ккал", response)
         self.assertIn("Чтобы изменить: /goal 2200", response)
 
-    def test_other_members_photos_commands_and_corrections_are_ignored(self):
+    def test_other_members_cannot_change_goal_food_or_use_owner_commands(self):
         meal = self.db.add_photo(photo(), now=0)
         self.db.finish(meal, result(), "text")
         self.db.set_goal(2200)
         queued_before = len(self.db.outgoing())
         updates = []
-        for index, text in enumerate(("/goal 2300", "/today", "/week", "/whoami", "съел всё"), 1):
+        for index, text in enumerate(("/goal 2300", "/whoami", "съел всё"), 1):
             updates.append({"update_id": index, "message": {
                 "chat": {"id": -100}, "from": {"id": 8}, "message_id": 100+index,
                 "date": photo()["date"], "text": text,
@@ -171,9 +171,56 @@ class ServiceTests(unittest.TestCase):
         self.service.ingest(now=10)
         self.assertEqual(self.db.goal(), 2200)
         self.assertEqual(self.db.notes(meal), [])
-        self.assertEqual(len(self.db.outgoing()), queued_before)
+        responses = self.db.outgoing()[queued_before:]
+        self.assertEqual(len(responses), 1)
+        self.assertIn("только владелец", responses[0]["body"])
         self.assertEqual(self.db.pending_updates(), [])
         self.ai.analyze.assert_not_called()
+
+    def test_other_members_can_view_reports_goal_and_help(self):
+        self.db.set_goal(2200)
+        now = photo()["date"]
+        for index, text in enumerate(("/today", "/week", "/goal", "/help"), 1):
+            self.service.receive([{"update_id": index, "message": {
+                "chat": {"id": -100}, "from": {"id": 8}, "message_id": 100+index,
+                "date": now, "text": text}}])
+        self.service.ingest(now=now)
+        entries = self.db.outgoing()
+        self.assertEqual([e["kind"] for e in entries], ["album", "album", "text", "text"])
+        self.assertIn("2200", entries[2]["body"])
+        self.assertTrue(all(len(e["images"]) == 3 for e in entries[:2]))
+        self.ai.analyze.assert_not_called()
+
+    def test_bot_other_chat_and_edited_commands_are_ignored(self):
+        self.db.set_goal(2200)
+        base = {"chat": {"id": -100}, "from": {"id": 8}, "message_id": 60,
+                "date": photo()["date"], "text": "/goal 2300"}
+        updates = [
+            {"update_id": 1, "message": dict(base, **{"from": {"id": 7, "is_bot": True}})},
+            {"update_id": 2, "message": dict(base, chat={"id": -200})},
+            {"update_id": 3, "edited_message": dict(base, **{"from": {"id": 7}})},
+        ]
+        self.service.receive(updates)
+        self.service.ingest(now=0)
+        self.assertEqual(self.db.goal(), 2200)
+        self.assertEqual(self.db.outgoing(), [])
+
+    def test_today_queues_album_and_passes_previous_seven_days_excluding_today(self):
+        now = photo()["date"]
+        msg = {"chat": {"id": -100}, "from": {"id": 7}, "message_id": 70,
+               "date": now, "text": "/today"}
+        with patch("food_log.service.render_daily_charts", return_value=[
+                ("summary", b"png1"), ("meals", b"png2"), ("macros", b"png3")]) as render:
+            self.service.receive([{"update_id": 1, "message": msg}])
+            self.service.ingest(now=now)
+        day, history, goal = render.call_args.args
+        self.assertEqual(str(day["date"]), "2026-11-15")
+        self.assertEqual([str(d["date"]) for d in history],
+                         [f"2026-11-{n:02d}" for n in range(8, 15)])
+        entry = self.db.outgoing()[0]
+        self.assertEqual(entry["kind"], "album")
+        self.assertEqual(entry["images"], [b"png1", b"png2", b"png3"])
+        self.assertIn("15.11.2026", entry["body"])
 
     def test_config_has_no_coach_access_setting(self):
         with self.assertRaises(TypeError):
@@ -264,7 +311,7 @@ class TelegramTests(unittest.TestCase):
         for item, image in zip(media, [b"one", b"two", b"three"]):
             self.assertEqual(parts[item["media"].removeprefix("attach://")], image)
 
-    def test_command_menu_is_scoped_to_owner_and_excludes_service_command(self):
+    def test_command_menu_is_scoped_to_group_and_excludes_service_command(self):
         import httpx
         import json
         calls = []
@@ -277,7 +324,7 @@ class TelegramTests(unittest.TestCase):
             TelegramAPI("fake-token", client=client).set_commands(-100, 7)
         payload = json.loads(calls[0].content)
         self.assertTrue(calls[0].url.path.endswith("/setMyCommands"))
-        self.assertEqual(payload["scope"], {"type": "chat_member", "chat_id": -100, "user_id": 7})
+        self.assertEqual(payload["scope"], {"type": "chat", "chat_id": -100})
         self.assertEqual([item["command"] for item in payload["commands"]],
                          ["today", "week", "goal", "help"])
 
