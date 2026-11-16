@@ -10,7 +10,8 @@ from zoneinfo import ZoneInfo
 import httpx
 from openai import OpenAI
 
-from .charts import render_charts
+from . import __version__
+from .charts import render_charts, render_daily_charts
 from .gi import CATALOG
 from .nutrition import PhotoAssessment
 from .meal_time import meal_category, is_food_correction
@@ -20,6 +21,7 @@ HELP = ("Отправь фото еды. В подписи можно указа
         "Для исправления ответь на фото/оценку или отредактируй подпись.\n"
         "Без reply уточнение (например «это ужин», «порция 200 г») относится к последней еде за сутки.\n"
         "/today — итог дня\n/week — графики за 7 дней\n/goal — цель калорий\n"
+        "Отчёты доступны всем участникам; фото, исправления и новая цель — только владельцу.\n"
         "Фото и подписи передаются OpenAI; оценки приблизительные.")
 COMMANDS = [
     {"command": "today", "description": "📋 Итог дня"},
@@ -39,9 +41,15 @@ class Config:
     timezone: str = "Europe/Moscow"
 
     def allowed(self, message):
-        return (message.get("chat", {}).get("id") == self.chat_id
-                and message.get("from", {}).get("id") == self.owner_id
-                and not message.get("from", {}).get("is_bot", False))
+        author = message.get("from", {})
+        if (message.get("chat", {}).get("id") != self.chat_id
+                or not author.get("id") or author.get("is_bot", False)):
+            return False
+        if author["id"] == self.owner_id:
+            return True
+        text = message.get("text", "").split()
+        return (not message.get("photo") and bool(text)
+                and text[0].split("@")[0].lower() in ("/today", "/week", "/goal", "/help", "/start"))
 
 
 class TelegramError(RuntimeError):
@@ -75,7 +83,7 @@ class TelegramAPI:
 
     def set_commands(self, chat, owner):
         return self.call("setMyCommands", {"commands": COMMANDS,
-            "scope": {"type": "chat_member", "chat_id": chat, "user_id": owner}})
+            "scope": {"type": "chat", "chat_id": chat}})
 
     def send_text(self, chat, reply, text):
         return self.call("sendMessage", dict(chat_id=chat, text=text[:4000],
@@ -179,7 +187,7 @@ class Service:
             msg = update.get("message") or update.get("edited_message", {})
             if not self.config.allowed(msg):
                 continue
-            # Фото тренера и обычный разговор в группе не сохраняем.
+            # Фото других участников и обычный разговор в группе не сохраняем.
             if msg.get("photo") and msg["from"]["id"] != self.config.owner_id:
                 continue
             if msg.get("photo") or msg.get("text"):
@@ -232,6 +240,8 @@ class Service:
                 value = self.db.goal()
                 text = (f"Цель: {value:.0f} ккал/день" if value is not None else "Цель не задана.")
                 text += "\nЧтобы изменить: /goal 2200"
+            elif msg["from"]["id"] != self.config.owner_id:
+                text = "Изменять цель может только владелец дневника."
             else:
                 try:
                     value = float(parts[1])
@@ -243,7 +253,15 @@ class Service:
                     text = "Укажи число от 100 до 20000 ккал/день: /goal 2200"
             self.db.queue(chat, mid, text)
         elif command == "/today":
-            self.db.queue(chat, mid, self.db.report(datetime.fromtimestamp(now, timezone.utc), 1, self.config.timezone))
+            days = self.db.daily(datetime.fromtimestamp(now, timezone.utc), 8, self.config.timezone)
+            day = days[-1]
+            day["as_of"] = datetime.fromtimestamp(now, ZoneInfo(self.config.timezone)).strftime("%H:%M")
+            caption = f"Отчёт за {day['date']:%d.%m.%Y}"
+            if day["pending"] or day["errors"]:
+                caption += (f"\nОжидают анализа/уточнения: {day['pending']}. "
+                            f"Ошибки: {day['errors']}.")
+            self.db.queue_album(chat, mid, caption, [image for _, image in
+                render_daily_charts(day, days[:-1], self.db.goal())])
         elif command == "/week":
             days = self.db.daily(datetime.fromtimestamp(now, timezone.utc), 7, self.config.timezone)
             caption = f"Отчёт за {days[0]['date']:%d.%m.%Y}–{days[-1]['date']:%d.%m.%Y}"
@@ -286,7 +304,7 @@ class Service:
             self.db.delivered(entry, sent["message_id"])
 
     def run(self):
-        LOG.info("Бот запущен. Остановка: Ctrl+C")
+        LOG.info("Бот %s запущен. Остановка: Ctrl+C", __version__)
         while True:
             try:
                 self.ingest(time.time())

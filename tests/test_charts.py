@@ -5,7 +5,7 @@ from datetime import date, timedelta
 from unittest.mock import patch
 
 import food_log.charts as charts
-from food_log.charts import render_charts
+from food_log.charts import render_charts, render_daily_charts
 
 
 class ChartTests(unittest.TestCase):
@@ -79,6 +79,119 @@ class ChartTests(unittest.TestCase):
         days[3]["meal_gl"] = {}
         _, content = render_charts(days, 2200)[0]
         self.assertNotEqual(content, b"")
+
+    def daily(self):
+        return {
+            "date": date(2026, 11, 16),
+            "timezone": "Europe/Moscow",
+            "meals": [
+                {"occurred_at": "2026-11-16T16:00:00+00:00", "meal": "Обед", "totals": {"kcal": 700, "protein": 40, "fat": 20, "carbs": 80}},
+                {"occurred_at": "2026-11-16T05:20:00+00:00", "meal": "Завтрак", "totals": {"kcal": 500, "protein": 25, "fat": 15, "carbs": 60}},
+            ],
+            "totals": {"kcal": 1200, "protein": 65, "fat": 35, "carbs": 140},
+        }
+
+    def test_daily_renders_approved_three_images(self):
+        rendered = render_daily_charts(self.daily(), [], 2200)
+        self.assertEqual([name for name, _ in rendered], ["summary", "meals", "macros"])
+        self.assertTrue(all(data.startswith(b"\x89PNG\r\n\x1a\n") for _, data in rendered))
+
+    def test_daily_summary_handles_over_goal_and_no_goal(self):
+        day = self.daily()
+        day["totals"]["kcal"] = 2700
+        self.assertEqual(len(render_daily_charts(day, [], 2200)), 3)
+        self.assertEqual(len(render_daily_charts(day, [], None)), 3)
+
+    def test_daily_empty_meals_does_not_invent_values(self):
+        day = self.daily()
+        day["meals"] = []
+        day["totals"] = None
+        rendered = render_daily_charts(day, [], 2200)
+        self.assertEqual(len(rendered), 3)
+
+    def test_daily_summary_has_period_and_empty_history_coverage(self):
+        with patch.object(charts, "_daily_png", side_effect=lambda fig: fig) as capture:
+            fig = charts._daily_summary(self.daily(), [], 2200)
+        texts = [text.get_text() for text in fig.texts]
+        self.assertIn("Среднее за 7 дней", texts)
+        self.assertIn("нет записей · 0/7", texts)
+        fig.clear()
+
+    def test_daily_over_goal_has_only_goal_percentage(self):
+        day = self.daily()
+        day["totals"]["kcal"] = 2700
+        with patch.object(charts, "_daily_png", side_effect=lambda fig: fig):
+            fig = charts._daily_summary(day, [], 2200)
+        texts = [text.get_text() for text in fig.texts]
+        self.assertIn("ккал · 122,7% от цели", texts)
+        self.assertFalse(any(text.get_text().endswith("%") for text in fig.axes[0].texts))
+        fig.clear()
+
+    def test_daily_today_color_tracks_goal_boundary(self):
+        for kcal, expected in ((2200, charts.GREEN), (2201, charts.RED)):
+            day = self.daily()
+            day["totals"]["kcal"] = kcal
+            with patch.object(charts, "_daily_png", side_effect=lambda fig: fig):
+                fig = charts._daily_summary(day, [], 2200)
+            today = next(text for text in fig.texts if text.get_text() == "Сегодня")
+            self.assertEqual(today.get_color(), expected)
+            fig.clear()
+
+    def test_daily_macros_empty_has_no_zero_legend(self):
+        day = self.daily()
+        day["meals"] = []
+        day["totals"] = None
+        with patch.object(charts, "_daily_png", side_effect=lambda fig: fig):
+            fig = charts._daily_macros(day)
+        self.assertNotIn("0 г", " ".join(text.get_text() for text in fig.texts))
+        self.assertIn("нет записей", [text.get_text() for text in fig.axes[0].texts])
+        fig.clear()
+
+    def test_daily_summary_empty_and_zero_are_distinguished(self):
+        for totals, expected in ((None, "нет записей"), ({"kcal": 0}, "2 200\nккал")):
+            day = self.daily()
+            day["totals"] = totals
+            with patch.object(charts, "_daily_png", side_effect=lambda fig: fig):
+                fig = charts._daily_summary(day, [], 2200)
+            self.assertIn(expected, [text.get_text() for text in fig.axes[0].texts])
+            charts.plt.close(fig)
+
+    def test_daily_average_excludes_missing_days_and_labels_period(self):
+        history = [{"date": date(2026, 11, 9) + timedelta(days=i),
+                    "totals": {"kcal": 1000 if i == 0 else 2000} if i < 2 else None}
+                   for i in range(7)]
+        with patch.object(charts, "_daily_png", side_effect=lambda fig: fig):
+            fig = charts._daily_summary(self.daily(), history, 2200)
+        texts = [text.get_text() for text in fig.texts]
+        self.assertIn("1 500", texts)
+        self.assertIn("Среднее 09.11–15.11", texts)
+        self.assertIn("ккал · записи 2/7", texts)
+        charts.plt.close(fig)
+
+    def test_daily_meals_sort_and_use_local_time(self):
+        with patch.object(charts, "_daily_png", side_effect=lambda fig: fig):
+            fig = charts._daily_meals(self.daily(), 2200)
+        labels = [text.get_text() for text in fig.axes[0].get_xticklabels()]
+        self.assertEqual(labels, ["08:20\nЗавтрак", "19:00\nОбед"])
+        self.assertEqual([bar.get_height() for bar in fig.axes[0].patches], [500, 700])
+        charts.plt.close(fig)
+
+    def test_daily_album_canvas_is_identical_with_many_meals(self):
+        import struct
+        day = self.daily()
+        day["meals"] = day["meals"] * 5
+        sizes = [struct.unpack(">II", image[16:24]) for _, image in render_daily_charts(day, [], 2200)]
+        self.assertEqual(len(set(sizes)), 1)
+
+    def test_tiny_summary_sectors_use_callout_to_keep_label_readable(self):
+        for kcal in (1, 2199, 2201):
+            day = self.daily()
+            day["totals"]["kcal"] = kcal
+            with patch.object(charts, "_daily_png", side_effect=lambda fig: fig):
+                fig = charts._daily_summary(day, [], 2200)
+            callouts = [text for text in fig.axes[0].texts if getattr(text, "arrow_patch", None)]
+            self.assertEqual(len(callouts), 1)
+            charts.plt.close(fig)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 import json
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone as utc_timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -191,7 +191,7 @@ class Store:
 
     def queue_album(self, chat, reply, caption, images):
         if len(images) != 3:
-            raise ValueError("Недельный альбом должен содержать три диаграммы")
+            raise ValueError("Альбом отчёта должен содержать три диаграммы")
         entry = self.conn.execute("INSERT INTO outbox(chat,reply,body,kind) VALUES (?,?,?,'album')",
                                   (chat, reply, caption)).lastrowid
         self.conn.executemany("INSERT INTO outbox_media VALUES (?,?,?)",
@@ -211,9 +211,10 @@ class Store:
         start = end - timedelta(days=days-1)
         buckets = {start + timedelta(days=i): dict(
             date=start + timedelta(days=i), totals=None, gl=None, gl_incomplete=False,
-            meal_gl={}, is_today=(start + timedelta(days=i) == end), pending=0, errors=0)
+            meal_gl={}, meals=[], timezone=timezone,
+            is_today=(start + timedelta(days=i) == end), pending=0, errors=0)
             for i in range(days)}
-        for row in self.conn.execute("SELECT * FROM meals"):
+        for row in self.conn.execute("SELECT * FROM meals ORDER BY eaten_at, id"):
             day = datetime.fromtimestamp(row["eaten_at"], zone).date()
             if day not in buckets:
                 continue
@@ -226,6 +227,9 @@ class Store:
             if assessment is None or assessment.totals() is None:
                 continue
             values = assessment.totals()
+            bucket["meals"].append(dict(
+                occurred_at=datetime.fromtimestamp(row["eaten_at"], utc_timezone.utc).isoformat(),
+                meal=assessment.category, totals=values))
             if bucket["totals"] is None:
                 bucket["totals"] = {key: 0 for key in values}
             for key, value in values.items():
