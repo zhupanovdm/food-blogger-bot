@@ -123,15 +123,15 @@ class StoreTests(unittest.TestCase):
         self.assertIn("нет записей", text)
         self.assertIn("уточнен", text)
 
-    def test_daily_chart_data_preserves_missing_and_unknown_gl(self):
+    def test_daily_chart_data_preserves_missing_and_totals(self):
         meal = self.db.add_photo(photo(), now=0)
         self.db.finish(meal, result(), "text")
         days = self.db.daily(datetime.fromtimestamp(photo()["date"], timezone.utc), 7)
         self.assertEqual(len(days), 7)
         self.assertIsNone(days[-2]["totals"])
         self.assertEqual(days[-1]["totals"]["kcal"], 195)
-        self.assertIsNone(days[-1]["gl"])
-        self.assertTrue(days[-1]["gl_incomplete"])
+        self.assertNotIn("gl", days[-1])
+        self.assertNotIn("gl_incomplete", days[-1])
 
     def test_goal_persists_after_reopening(self):
         self.db.set_goal(2200)
@@ -141,11 +141,11 @@ class StoreTests(unittest.TestCase):
 
     def test_pending_album_survives_restart_with_image_order(self):
         with self.db.conn:
-            self.db.queue_album(-100, 10, "Отчёт за 09.11–15.11", [b"calories", b"macros", b"gl"])
+            self.db.queue_album(-100, 10, "Отчёт за 09.11–15.11", [b"calories", b"macros", b"daily-macros"])
         self.db.close()
         self.db = Store(self.path)
         entry = self.db.outgoing()[0]
-        self.assertEqual(entry["images"], [b"calories", b"macros", b"gl"])
+        self.assertEqual(entry["images"], [b"calories", b"macros", b"daily-macros"])
         self.assertEqual(entry["body"], "Отчёт за 09.11–15.11")
 
     def test_caption_edit_is_newer_than_old_correction_and_duplicate_does_not_undo_it(self):
