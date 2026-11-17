@@ -41,18 +41,20 @@ class NutritionTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             Assessment(status="ok", items=[], explanation="", question="")
 
-    def test_glycemic_load_uses_reference_and_eaten_carbs(self):
-        result = Assessment(status="ok", items=[item(gi_key="quinoa_cooked", available_carbs=40)],
-                            explanation="", question="")
-        value, incomplete = result.glycemic_load()
-        self.assertAlmostEqual(value, 53 * 40 * .5 / 100)
-        self.assertFalse(incomplete)
+    def test_schema_and_new_results_do_not_include_glycemic_fields(self):
+        schema = PhotoAssessment.model_json_schema()
+        self.assertNotIn("gi_key", str(schema))
+        self.assertNotIn("available_carbs", str(schema))
+        self.assertEqual(set(item().model_dump()),
+                         {"name", "portion_grams", "eaten_fraction", "kcal", "protein", "fat", "carbs"})
 
-    def test_unknown_gi_is_not_zero(self):
-        result = Assessment(status="ok", items=[item(gi_key=None, available_carbs=40)],
-                            explanation="", question="")
-        self.assertEqual(result.glycemic_load(), (None, True))
-
-    def test_available_carbs_cannot_exceed_total(self):
+    def test_legacy_glycemic_fields_remain_readable_and_are_not_resaved(self):
+        import json
+        saved = dict(status="ok", items=[dict(item().model_dump(),
+                     gi_key="quinoa_cooked", available_carbs=40)], explanation="", question="")
+        result = Assessment.model_validate_json(json.dumps(saved))
+        self.assertEqual(result.totals()["kcal"], 195)
+        self.assertNotIn("gi_key", result.model_dump_json())
+        self.assertNotIn("available_carbs", result.model_dump_json())
         with self.assertRaises(ValidationError):
-            item(available_carbs=100)
+            item(unrecognized_field=1)

@@ -2,8 +2,6 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .gi import CATALOG
-
 Amount = Annotated[float, Field(ge=0, le=100000, allow_inf_nan=False)]
 
 
@@ -17,14 +15,15 @@ class Item(BaseModel):
     protein: Amount
     fat: Amount
     carbs: Amount
-    available_carbs: Amount | None = None
-    gi_key: Literal["red_lentils_cooked", "cannellini_canned", "baked_beans_canned", "quinoa_cooked"] | None = None
 
-    @model_validator(mode="after")
-    def check_carbs(self):
-        if self.available_carbs is not None and self.available_carbs > self.carbs:
-            raise ValueError("Усвояемые углеводы не могут превышать общие")
-        return self
+    @model_validator(mode="before")
+    @classmethod
+    def read_legacy_fields(cls, value):
+        # Старые оценки в JSON остаются читаемыми; новая схема не содержит ГИ/ГН.
+        if isinstance(value, dict):
+            return {key: item for key, item in value.items()
+                    if key not in ("gi_key", "available_carbs")}
+        return value
 
 
 class Assessment(BaseModel):
@@ -50,22 +49,6 @@ class Assessment(BaseModel):
             return None
         return {key: sum(getattr(item, key) * item.eaten_fraction for item in self.items)
                 for key in ("kcal", "protein", "fat", "carbs")}
-
-    def glycemic_load(self):
-        if self.status != "ok":
-            return None, True
-        value, known, incomplete = 0.0, False, False
-        for item in self.items:
-            if item.eaten_fraction == 0:
-                continue
-            if item.available_carbs == 0:
-                known = True
-            elif item.gi_key and item.available_carbs is not None:
-                value += CATALOG[item.gi_key]["gi"] * item.available_carbs * item.eaten_fraction / 100
-                known = True
-            else:
-                incomplete = True
-        return (value if known else None), incomplete
 
     def render(self):
         if self.status == "clarify":

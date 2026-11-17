@@ -23,14 +23,6 @@ ORANGE = "#b16c32"
 GREEN = "#548168"
 REST = "#d4dfd9"
 RED = "#bd4949"
-GL_COLORS = {
-    "Завтрак": "#d3b89a",
-    "Обед": "#b78555",
-    "Ужин": "#805332",
-    "Полдник": "#c19a66",
-    "Перекус": "#9b6d43",
-    "Без категории": "#9da7a5",
-}
 
 
 def _fmt(value: float) -> str:
@@ -139,46 +131,12 @@ def _macros(days: list[dict]) -> bytes:
     return _png(fig)
 
 
-def _glycemic_load(days: list[dict]) -> bytes:
-    values = [d.get("gl") for d in days]
-    ymax, ticks = _scale(values, 200)
-    fig, ax = _base("Гликемическая нагрузка · 7 дней", "расчётная ГН, ед.", days, ymax, ticks)
-    x = np.arange(len(days))
-    categories = list(GL_COLORS)
-    bottom = np.zeros(len(days))
-    for category in categories:
-        vals = np.array([float(d.get("meal_gl", {}).get(category, 0) or 0) for d in days])
-        bars = ax.bar(x, vals, bottom=bottom, width=0.48, color=GL_COLORS[category], label=category)
-        for i, day in enumerate(days):
-            if day.get("gl_incomplete") or day.get("is_today"):
-                bars[i].set_hatch("///")
-                bars[i].set_edgecolor(BG)
-                bars[i].set_linewidth(0)
-        bottom += vals
-    for i, (value, day) in enumerate(zip(bottom, days)):
-        if day.get("gl") is None and not any(day.get("meal_gl", {}).values()):
-            label = "нет\nоценки" if day.get("totals") is not None else "нет\nзаписей"
-            ax.text(i, max(10, ymax * .15), label, ha="center", color=MUTED, fontsize=10)
-        elif day.get("gl") is not None:
-            suffix = " + ?" if day.get("gl_incomplete") else ""
-            ax.text(i, value + 7, f"≈{value:.0f}{suffix}", ha="center", color=INK, fontsize=10)
-    used = [category for category in categories if any(float(d.get("meal_gl", {}).get(category, 0) or 0) > 0 for d in days)]
-    handles = [Patch(facecolor=GL_COLORS[category], label=category) for category in used]
-    if any(d.get("gl_incomplete") for d in days):
-        handles.append(Patch(facecolor=MUTED, hatch="///", edgecolor=BG, linewidth=0, label="Неполный итог"))
-    if any(d.get("is_today") for d in days):
-        handles.append(Patch(facecolor=MUTED, hatch="///", edgecolor=BG, linewidth=0, label="Сегодня"))
-    _legend(ax, handles)
-    return _png(fig)
-
-
 def render_charts(days: list[dict], goal: float | None) -> list[tuple[str, bytes]]:
     """Render approved weekly charts. `days` must already contain at most seven days."""
     if len(days) > 7:
         raise ValueError("Ожидается не более 7 дней")
     return [("calories", _calories(days, goal)),
-            ("macros", _macros(days)),
-            ("glycemic-load", _glycemic_load(days))]
+            ("macros", _macros(days))]
 
 
 def _daily_png(fig) -> bytes:

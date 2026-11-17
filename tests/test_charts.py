@@ -22,44 +22,28 @@ class ChartTests(unittest.TestCase):
             result.append({
                 "date": start + timedelta(days=i),
                 "totals": None if i == 3 else {"kcal": 2000 + i * 50, "protein": 120, "fat": 70, "carbs": 220},
-                "gl": None if i == 3 else 90 + i,
-                "gl_incomplete": i in (1, 6),
-                "meal_gl": {} if i == 3 else {"Завтрак": 20, "Обед": 40, "Ужин": 30},
                 "is_today": i == 6,
             })
         return result
 
-    def test_renders_three_nonempty_pngs(self):
+    def test_renders_two_nonempty_pngs(self):
         rendered = render_charts(self.days(), 2200)
-        self.assertEqual([name for name, _ in rendered], ["calories", "macros", "glycemic-load"])
+        self.assertEqual([name for name, _ in rendered], ["calories", "macros"])
         for _, content in rendered:
             self.assertTrue(content.startswith(b"\x89PNG\r\n\x1a\n"))
             self.assertGreater(len(content), 10_000)
 
     def test_goal_is_optional(self):
-        self.assertEqual(len(render_charts(self.days(), None)), 3)
+        self.assertEqual(len(render_charts(self.days(), None)), 2)
 
     def test_scales_to_large_values(self):
         days = self.days()
         days[0]["totals"]["kcal"] = 8000
         days[1]["totals"]["carbs"] = 600
-        days[2]["gl"] = 400
         rendered = render_charts(days, 6000)
-        self.assertEqual(len(rendered), 3)
+        self.assertEqual(len(rendered), 2)
         for _, content in rendered:
             self.assertGreater(len(content), 10_000)
-
-    def test_gl_without_estimate_is_distinguished_from_missing_day(self):
-        days = self.days()
-        days[0]["totals"] = {"kcal": 2000, "protein": 120, "fat": 70, "carbs": 220}
-        days[0]["gl"] = None
-        days[0]["meal_gl"] = {}
-        with patch.object(charts, "_png", side_effect=lambda fig: fig) as capture:
-            fig = charts._glycemic_load(days)
-        texts = [text.get_text() for text in fig.axes[0].texts]
-        self.assertIn("нет\nоценки", texts)
-        self.assertNotIn("нет\nзаписей", texts[:1])
-        fig.clear()
 
     def test_missing_day_keeps_nan_line_and_no_zero_value(self):
         days = self.days()
@@ -76,7 +60,6 @@ class ChartTests(unittest.TestCase):
 
     def test_missing_day_is_not_zero(self):
         days = self.days()
-        days[3]["meal_gl"] = {}
         _, content = render_charts(days, 2200)[0]
         self.assertNotEqual(content, b"")
 

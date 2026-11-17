@@ -111,6 +111,22 @@ class Store:
         self.conn.commit()
         return meal
 
+    def text_meal(self, chat, message):
+        row = self.conn.execute("SELECT id FROM meals WHERE identity=?",
+                                (f"{chat}:text:{message}",)).fetchone()
+        return row[0] if row else None
+
+    def add_text_meal(self, msg, body, now, edited=False, sequence=0):
+        chat, mid = msg["chat"]["id"], msg["message_id"]
+        with self.conn:
+            self.conn.execute("""INSERT OR IGNORE INTO meals(identity,chat,source,eaten_at,ready)
+                              VALUES (?,?,?,?,?)""",
+                              (f"{chat}:text:{mid}", chat, mid, msg["date"], now))
+            meal = self.text_meal(chat, mid)
+            self.add_note(meal, mid, body, now, edited=edited,
+                          version=msg.get("edit_date", msg["date"]), sequence=sequence)
+        return meal
+
     def link(self, chat, message, meal):
         self.conn.execute("INSERT OR IGNORE INTO links VALUES (?,?,?)", (chat, message, meal))
 
@@ -190,8 +206,8 @@ class Store:
                           (chat, reply, caption, image))
 
     def queue_album(self, chat, reply, caption, images):
-        if len(images) != 3:
-            raise ValueError("Альбом отчёта должен содержать три диаграммы")
+        if len(images) not in (2, 3):
+            raise ValueError("Альбом отчёта должен содержать две или три диаграммы")
         entry = self.conn.execute("INSERT INTO outbox(chat,reply,body,kind) VALUES (?,?,?,'album')",
                                   (chat, reply, caption)).lastrowid
         self.conn.executemany("INSERT INTO outbox_media VALUES (?,?,?)",
@@ -210,8 +226,7 @@ class Store:
         end = now.astimezone(zone).date()
         start = end - timedelta(days=days-1)
         buckets = {start + timedelta(days=i): dict(
-            date=start + timedelta(days=i), totals=None, gl=None, gl_incomplete=False,
-            meal_gl={}, meals=[], timezone=timezone,
+            date=start + timedelta(days=i), totals=None, meals=[], timezone=timezone,
             is_today=(start + timedelta(days=i) == end), pending=0, errors=0)
             for i in range(days)}
         for row in self.conn.execute("SELECT * FROM meals ORDER BY eaten_at, id"):
@@ -221,8 +236,6 @@ class Store:
             bucket = buckets[day]
             bucket["pending"] += row["state"] in ("pending", "clarify")
             bucket["errors"] += row["state"] == "error"
-            if row["state"] in ("pending", "clarify", "error"):
-                bucket["gl_incomplete"] = True
             assessment = Assessment.model_validate_json(row["result"]) if row["result"] else None
             if assessment is None or assessment.totals() is None:
                 continue
@@ -234,12 +247,6 @@ class Store:
                 bucket["totals"] = {key: 0 for key in values}
             for key, value in values.items():
                 bucket["totals"][key] += value
-            gl, incomplete = assessment.glycemic_load()
-            bucket["gl_incomplete"] |= incomplete
-            if gl is not None:
-                bucket["gl"] = (bucket["gl"] or 0) + gl
-                category = assessment.category
-                bucket["meal_gl"][category] = bucket["meal_gl"].get(category, 0) + gl
         return list(buckets.values())
 
     def outgoing(self):

@@ -24,6 +24,117 @@ class ServiceTests(unittest.TestCase):
         self.db.close()
         self.tmp.cleanup()
 
+    def food_message(self, text="/food Обед: гречка 200 г и курица", mid=80):
+        return {"chat": {"id": -100}, "from": {"id": 7}, "message_id": mid,
+                "date": photo()["date"], "text": text}
+
+    def ingest_message(self, msg, uid=100, edited=False):
+        self.service.receive([{"update_id": uid,
+                               "edited_message" if edited else "message": msg}])
+        self.service.ingest(now=msg.get("edit_date", msg["date"]) + 1)
+
+    def test_food_creates_separate_meal_without_images_and_keeps_time(self):
+        self.db.add_photo(photo(), now=0)
+        msg = self.food_message()
+        msg["reply_to_message"] = {"message_id": photo()["message_id"]}
+        self.ingest_message(msg)
+        self.service.analyze_one(now=msg["date"] + 2)  # предыдущее фото
+        self.service.analyze_one(now=msg["date"] + 3)
+        meal = self.db.conn.execute("SELECT * FROM meals WHERE source=80").fetchone()
+        self.assertIsNotNone(meal)
+        self.assertEqual(meal["eaten_at"], msg["date"])
+        args = self.ai.analyze.call_args.kwargs
+        self.assertEqual(args["images"], [])
+        self.assertEqual(args["notes"], ["Обед: гречка 200 г и курица"])
+        self.assertEqual(args["context"]["category"], "Обед")
+        self.assertEqual(self.db.conn.execute("SELECT COUNT(*) FROM meals").fetchone()[0], 2)
+
+    def test_food_duplicates_after_restart_do_not_reanalyze(self):
+        msg = self.food_message()
+        self.ingest_message(msg)
+        self.assertTrue(self.service.analyze_one(now=msg["date"] + 2))
+        self.db.close()
+        self.db = Store(Path(self.tmp.name) / "db.sqlite3")
+        self.service.db = self.db
+        self.ingest_message(msg)
+        self.ingest_message(msg, uid=101)
+        self.assertFalse(self.service.analyze_one(now=msg["date"] + 3))
+        self.assertEqual(self.db.conn.execute("SELECT COUNT(*) FROM meals").fetchone()[0], 1)
+        self.assertEqual(self.ai.analyze.call_count, 1)
+
+    def test_food_edit_and_reply_update_same_meal(self):
+        msg = self.food_message()
+        self.ingest_message(msg)
+        self.assertTrue(self.service.analyze_one(now=msg["date"] + 2))
+        for uid, text in ((101, "/food Ужин: гречка 100 г"), (102, "Ужин: гречка 150 г")):
+            self.ingest_message(dict(msg, text=text, edit_date=msg["date"] + uid), uid, edited=True)
+            self.assertTrue(self.service.analyze_one(now=msg["date"] + uid + 2))
+        reply = self.food_message("съел половину", mid=81)
+        reply["reply_to_message"] = {"message_id": 80}
+        reply["date"] += 150
+        self.ingest_message(reply, uid=103)
+        self.assertTrue(self.service.analyze_one(now=msg["date"] + 200))
+        args = self.ai.analyze.call_args.kwargs
+        self.assertEqual(args["notes"], ["Ужин: гречка 150 г", "съел половину"])
+        self.assertEqual(args["context"]["category"], "Ужин")
+        self.assertEqual(self.db.conn.execute("SELECT COUNT(*) FROM meals").fetchone()[0], 1)
+        self.assertEqual(self.db.conn.execute("SELECT eaten_at FROM meals").fetchone()[0], msg["date"])
+
+    def test_empty_food_command_shows_usage_without_meal(self):
+        self.ingest_message(self.food_message("/food   "))
+        self.assertEqual(self.db.conn.execute("SELECT COUNT(*) FROM meals").fetchone()[0], 0)
+        self.assertIn("/food", self.db.outgoing()[0]["body"])
+
+    def test_food_other_members_and_other_chats_are_ignored(self):
+        for uid, msg in enumerate((dict(self.food_message(), **{"from": {"id": 8}}),
+                                   dict(self.food_message(), chat={"id": -200})), 100):
+            self.ingest_message(msg, uid)
+        self.assertEqual(self.db.conn.execute("SELECT COUNT(*) FROM meals").fetchone()[0], 0)
+        self.assertFalse(self.service.analyze_one(now=photo()["date"] + 200))
+
+    def test_food_edit_failure_preserves_previous_assessment(self):
+        msg = self.food_message("/food@my_food_blogger_bot Завтрак: каша")
+        self.ingest_message(msg)
+        self.assertTrue(self.service.analyze_one(now=msg["date"] + 2))
+        previous = self.db.conn.execute("SELECT result FROM meals").fetchone()[0]
+        self.ingest_message(dict(msg, text="/food каша 100 г", edit_date=msg["date"] + 10), 101, edited=True)
+        self.ai.analyze.side_effect = RuntimeError("failure")
+        with self.assertLogs("food_log.service", level="WARNING"):
+            self.service.analyze_one(now=msg["date"] + 12)
+        self.assertEqual(self.db.conn.execute("SELECT result FROM meals").fetchone()[0], previous)
+
+    def test_two_image_album_survives_restart(self):
+        with self.db.conn:
+            self.db.queue_album(-100, 80, "Неделя", [b"calories", b"macros"])
+        self.db.close()
+        self.db = Store(Path(self.tmp.name) / "db.sqlite3")
+        self.assertEqual(self.db.outgoing()[0]["images"], [b"calories", b"macros"])
+
+    def test_stale_food_edit_does_not_undo_newer_description(self):
+        msg = self.food_message()
+        self.ingest_message(msg)
+        self.ingest_message(dict(msg, text="/food Ужин: каша 100 г", edit_date=msg["date"] + 20), 102, edited=True)
+        self.ingest_message(dict(msg, text="/food Обед: каша 300 г", edit_date=msg["date"] + 10), 101, edited=True)
+        self.assertTrue(self.service.analyze_one(now=msg["date"] + 30))
+        self.assertEqual(self.ai.analyze.call_args.kwargs["notes"], ["Ужин: каша 100 г"])
+        self.assertEqual(self.ai.analyze.call_args.kwargs["context"]["category"], "Ужин")
+
+    def test_edited_unrelated_message_cannot_create_food_command(self):
+        self.ingest_message(dict(self.food_message(), edit_date=photo()["date"] + 10), edited=True)
+        self.assertEqual(self.db.conn.execute("SELECT COUNT(*) FROM meals").fetchone()[0], 0)
+
+    def test_openai_text_only_request_contains_description_without_image(self):
+        client = Mock()
+        client.responses.parse.return_value = SimpleNamespace(output_parsed=result())
+        ai = OpenAIAnalyzer("key", "gpt-4.1-mini", client=client)
+        ai.analyze(images=[], captions=[], notes=["каша 200 г"])
+        sent = client.responses.parse.call_args.kwargs
+        content = sent["input"][0]["content"]
+        self.assertEqual([item["type"] for item in content], ["input_text"])
+        self.assertIn("каша 200 г", content[0]["text"])
+        self.assertNotIn("gi_key", str(sent["text_format"].model_json_schema()))
+        self.assertFalse(sent["store"])
+
     def test_only_owner_photos_in_allowed_group(self):
         updates = [{"update_id": 1, "message": photo()}]
         other = photo(mid=11)
@@ -188,7 +299,7 @@ class ServiceTests(unittest.TestCase):
         entries = self.db.outgoing()
         self.assertEqual([e["kind"] for e in entries], ["album", "album", "text", "text"])
         self.assertIn("2200", entries[2]["body"])
-        self.assertTrue(all(len(e["images"]) == 3 for e in entries[:2]))
+        self.assertEqual([len(e["images"]) for e in entries[:2]], [3, 2])
         self.ai.analyze.assert_not_called()
 
     def test_bot_other_chat_and_edited_commands_are_ignored(self):
@@ -235,7 +346,7 @@ class ServiceTests(unittest.TestCase):
             self.service.ingest(now=0)
         self.assertEqual(self.db.goal(), 2200)
 
-    def test_week_queues_one_album_with_three_pngs_and_period(self):
+    def test_week_queues_one_album_with_two_pngs_and_period(self):
         msg = {"chat": {"id": -100}, "from": {"id": 7}, "message_id": 50,
                "date": photo()["date"], "text": "/week"}
         self.service.receive([{"update_id": 20, "message": msg}])
@@ -243,7 +354,7 @@ class ServiceTests(unittest.TestCase):
         entries = self.db.outgoing()
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0]["kind"], "album")
-        self.assertEqual(len(entries[0]["images"]), 3)
+        self.assertEqual(len(entries[0]["images"]), 2)
         self.assertTrue(all(image.startswith(b"\x89PNG") for image in entries[0]["images"]))
         self.assertIn("Отчёт за 09.11.2026–15.11.2026", entries[0]["body"])
 
@@ -326,7 +437,7 @@ class TelegramTests(unittest.TestCase):
         self.assertTrue(calls[0].url.path.endswith("/setMyCommands"))
         self.assertEqual(payload["scope"], {"type": "chat", "chat_id": -100})
         self.assertEqual([item["command"] for item in payload["commands"]],
-                         ["today", "week", "goal", "help"])
+                         ["food", "today", "week", "goal", "help"])
 
     def test_long_poll_and_photo_upload_use_expected_api(self):
         import httpx
