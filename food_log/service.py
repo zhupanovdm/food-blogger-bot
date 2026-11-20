@@ -12,12 +12,13 @@ from openai import OpenAI
 
 from . import __version__
 from .charts import render_charts, render_daily_charts
-from .nutrition import PhotoAssessment
-from .meal_time import meal_category, is_food_correction
+from .nutrition import Assessment, PhotoAssessment
+from .meal_time import MealTimeError, resolve_meal_time, metadata_only, is_food_correction
 
 LOG = logging.getLogger(__name__)
 HELP = ("Для еды без фото: /food овсянка 200 г и банан.\n"
         "Отправь фото еды. В подписи можно указать вес, состав и сколько съел.\n"
+        "Можно указать: вчера ужин в 20:30, сегодня завтрак или 19.11.2026 в 08:00.\n"
         "Для исправления ответь на исходное сообщение/оценку или отредактируй сообщение еды.\n"
         "Без reply уточнение (например «это ужин», «порция 200 г») относится к последней еде за сутки.\n"
         "/today — итог дня\n/week — графики за 7 дней\n/goal — цель калорий\n"
@@ -146,7 +147,7 @@ question всегда пустой. not_food допустим только ко�
 Если предоставленные данные не описывают еду, status=not_food, items=[]. При ok items не пуст.
 context.evidence — актуальные подписи и уточнения в хронологическом порядке.
 Более поздний текст, включая редактуру подписи, исправляет более ранний.
-category возьми из context.category: она учитывает местное время исходного сообщения
+category возьми из context.category: она учитывает исправленные дату и время еды
 и явные названия приёмов пищи из текста. Не спрашивай название приёма пищи.
 explanation — короткие существенные допущения, максимум 2 предложения.
 """
@@ -223,9 +224,15 @@ class Service:
                     if target is None and is_food_correction(msg["text"]):
                         target = self.db.latest_meal(chat, msg["date"])
                 if target is not None:
-                    self.db.add_note(target, msg["message_id"], msg["text"], now,
+                    previous = self.db.conn.execute("SELECT * FROM meals WHERE id=?", (target,)).fetchone()
+                    old_note = self.db.conn.execute("SELECT body FROM notes WHERE chat=? AND message=?",
+                                                    (chat, msg["message_id"])).fetchone()
+                    changed = self.db.add_note(target, msg["message_id"], msg["text"], now,
                                      edited=edited, version=msg.get("edit_date", msg["date"]),
-                                     sequence=update["update_id"])
+                                     sequence=update["update_id"], sent_at=msg["date"])
+                    if (changed and previous["state"] == "ok" and metadata_only(msg["text"])
+                            and (old_note is None or metadata_only(old_note["body"]))):
+                        self.correct_metadata(previous)
             with self.db.conn:
                 self.db.done(update["update_id"])
 
@@ -285,6 +292,25 @@ class Service:
                 caption += f"\nОжидают анализа/уточнения: {pending}. Ошибки: {errors}."
             self.db.queue_album(chat, mid, caption, [image for _, image in render_charts(days, self.db.goal())])
 
+    def meal_moment(self, meal):
+        return resolve_meal_time(meal["original_at"], self.config.timezone,
+                                 self.db.evidence(meal["id"]))
+
+    def assessment_text(self, assessment, moment):
+        local = datetime.fromtimestamp(moment.eaten_at, ZoneInfo(self.config.timezone))
+        note = "" if moment.time_explicit else " (время сообщения; время еды не указано)"
+        return f"Дата: {local:%d.%m.%Y} · {local:%H:%M}{note}\n" + assessment.render()
+
+    def correct_metadata(self, meal):
+        try:
+            moment = self.meal_moment(meal)
+            assessment = Assessment.model_validate_json(meal["result"])
+            assessment.category = moment.category
+            self.db.finish(meal["id"], assessment, self.assessment_text(assessment, moment),
+                           eaten_at=moment.eaten_at)
+        except MealTimeError as exc:
+            self.db.time_error(meal["id"], str(exc), preserve_state=True)
+
     def analyze_one(self, now):
         meal = self.db.next_meal(now)
         if meal is None:
@@ -292,15 +318,19 @@ class Service:
         try:
             photos = self.db.photos(meal["id"])
             evidence = self.db.evidence(meal["id"])
-            category = meal_category(meal["eaten_at"], self.config.timezone, evidence)
-            local_time = datetime.fromtimestamp(meal["eaten_at"], timezone.utc).astimezone(
+            moment = self.meal_moment(meal)
+            category = moment.category
+            local_time = datetime.fromtimestamp(moment.eaten_at, timezone.utc).astimezone(
                 ZoneInfo(self.config.timezone)).isoformat()
             assessment = self.analyzer.analyze(
                 images=[self.telegram.download(p["file_id"]) for p in photos],
                 captions=[p["caption"] for p in photos], notes=self.db.notes(meal["id"]),
                 context={"category": category, "meal_local_time": local_time, "evidence": evidence})
             assessment.category = category
-            self.db.finish(meal["id"], assessment, assessment.render())
+            self.db.finish(meal["id"], assessment, self.assessment_text(assessment, moment),
+                           eaten_at=moment.eaten_at)
+        except MealTimeError as exc:
+            self.db.time_error(meal["id"], str(exc))
         except Exception as exc:
             # Не выводим exception text: HTTP-ошибки могут содержать секретный URL.
             LOG.warning("Анализ записи %s: %s", meal["id"], type(exc).__name__)

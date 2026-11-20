@@ -135,6 +135,98 @@ class ServiceTests(unittest.TestCase):
         self.assertNotIn("gi_key", str(sent["text_format"].model_json_schema()))
         self.assertFalse(sent["store"])
 
+    def test_caption_yesterday_moves_meal_into_previous_day(self):
+        from datetime import datetime, timezone
+        msg = photo(caption="Вчера ужин, булгур 2 жаренные котлеты")
+        self.ingest_message(msg)
+        self.assertTrue(self.service.analyze_one(now=msg["date"] + 5))
+        meal = self.db.conn.execute("SELECT * FROM meals").fetchone()
+        self.assertEqual(meal["eaten_at"], msg["date"] - 86400)
+        self.assertEqual(meal["original_at"], msg["date"])
+        self.assertEqual(self.ai.analyze.call_args.kwargs["context"]["category"], "Ужин")
+        days = self.db.daily(datetime.fromtimestamp(msg["date"], timezone.utc), 2)
+        self.assertIsNone(days[-1]["totals"])
+        self.assertEqual(days[-2]["totals"]["kcal"], 195)
+        self.assertIn("14.11.2026", self.db.outgoing()[0]["body"])
+
+    def test_metadata_reply_preserves_nutrition_without_model_and_survives_duplicates(self):
+        import json
+        msg = self.food_message("/food рис 200 г")
+        self.ingest_message(msg)
+        self.service.analyze_one(now=msg["date"] + 5)
+        previous = self.db.conn.execute("SELECT result FROM meals").fetchone()[0]
+        self.db.link(-100, 1000, 1)
+        reply = self.food_message("вчера ужин в 20:30", mid=81)
+        reply["date"] += 60
+        reply["reply_to_message"] = {"message_id": 1000}
+        self.ingest_message(reply, uid=101)
+        self.assertFalse(self.service.analyze_one(now=reply["date"] + 5))
+        meal = self.db.conn.execute("SELECT * FROM meals").fetchone()
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        expected = datetime.fromtimestamp(msg["date"]-86400, ZoneInfo("Europe/Moscow")).replace(hour=20,minute=30,second=0)
+        self.assertEqual(meal["eaten_at"], int(expected.timestamp()))
+        self.assertEqual(json.loads(meal["result"])["items"], json.loads(previous)["items"])
+        self.assertEqual(json.loads(meal["result"])["category"], "Ужин")
+        self.assertEqual(self.ai.analyze.call_count, 1)
+        self.assertIn("20:30", self.db.outgoing()[-1]["body"])
+        queued = len(self.db.outgoing())
+        self.ingest_message(reply, uid=102)
+        self.assertEqual(len(self.db.outgoing()), queued)
+        self.assertEqual(self.db.conn.execute("SELECT COUNT(*) FROM meals").fetchone()[0], 1)
+        # Свободное уточнение после переноса на вчера всё ещё относится к этой записи.
+        self.ingest_message(dict(reply, message_id=82, text="в 21:15", reply_to_message=None), uid=103)
+        self.assertIn("21:15", self.db.outgoing()[-1]["body"])
+
+    def test_bad_datetime_preserves_old_result_and_can_be_corrected(self):
+        msg = self.food_message()
+        self.ingest_message(msg)
+        self.service.analyze_one(now=msg["date"]+5)
+        previous = dict(self.db.conn.execute("SELECT * FROM meals").fetchone())
+        reply = self.food_message("31.02.2026 в 25:00", mid=81)
+        reply["date"] += 10
+        reply["reply_to_message"] = {"message_id": 80}
+        self.ingest_message(reply, uid=101)
+        self.service.analyze_one(now=reply["date"]+5)
+        failed = self.db.conn.execute("SELECT * FROM meals").fetchone()
+        self.assertEqual(failed["eaten_at"], previous["eaten_at"])
+        self.assertEqual(failed["result"], previous["result"])
+        self.assertIn("Неверная", self.db.outgoing()[-1]["body"])
+        reply.update(text="14.11.2026 в 20:30", edit_date=reply["date"]+30)
+        self.ingest_message(reply, uid=102, edited=True)
+        self.service.analyze_one(now=reply["date"]+40)
+        self.assertEqual(self.db.conn.execute("SELECT state FROM meals").fetchone()[0], "ok")
+
+    def test_edited_yesterday_caption_uses_original_date_and_can_remove_date(self):
+        msg = photo(caption="вчера ужин в 20:30, рис")
+        self.ingest_message(msg)
+        self.service.analyze_one(now=msg["date"]+5)
+        edited = dict(msg, caption="вчера ужин в 21:30, рис", edit_date=msg["date"]+86400)
+        self.ingest_message(edited, uid=101, edited=True)
+        self.service.analyze_one(now=edited["edit_date"]+5)
+        expected = msg["date"]-86400
+        self.assertEqual(self.db.conn.execute("SELECT eaten_at FROM meals").fetchone()[0]//86400,
+                         expected//86400)
+        self.ingest_message(dict(edited, caption="рис", edit_date=edited["edit_date"]+60), uid=102, edited=True)
+        self.service.analyze_one(now=edited["edit_date"]+65)
+        self.assertEqual(self.db.conn.execute("SELECT eaten_at FROM meals").fetchone()[0], msg["date"])
+
+    def test_removing_nutritional_correction_requires_reanalysis(self):
+        msg = self.food_message()
+        self.ingest_message(msg)
+        self.service.analyze_one(now=msg["date"]+5)
+        reply = self.food_message("съел половину", mid=81)
+        reply["reply_to_message"] = {"message_id": 80}
+        reply["date"] += 10
+        self.ingest_message(reply, uid=101)
+        self.service.analyze_one(now=reply["date"]+5)
+        calls = self.ai.analyze.call_count
+        self.ingest_message(dict(reply, text="вчера ужин", edit_date=reply["date"]+10), uid=102, edited=True)
+        self.assertTrue(self.service.analyze_one(now=reply["date"]+15))
+        self.assertEqual(self.ai.analyze.call_count, calls+1)
+        self.assertEqual(self.ai.analyze.call_args.kwargs["notes"],
+                         ["Обед: гречка 200 г и курица", "вчера ужин"])
+
     def test_only_owner_photos_in_allowed_group(self):
         updates = [{"update_id": 1, "message": photo()}]
         other = photo(mid=11)

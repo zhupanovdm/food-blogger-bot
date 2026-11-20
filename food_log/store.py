@@ -40,6 +40,10 @@ class Store:
                 entry INTEGER REFERENCES outbox(id), position INTEGER, image BLOB NOT NULL,
                 PRIMARY KEY(entry,position));
         """)
+        columns = {r[1] for r in self.conn.execute("PRAGMA table_info(meals)")}
+        if "original_at" not in columns:
+            self.conn.execute("ALTER TABLE meals ADD COLUMN original_at INTEGER")
+            self.conn.execute("UPDATE meals SET original_at=eaten_at")
         columns = {r[1] for r in self.conn.execute("PRAGMA table_info(outbox)")}
         for name, declaration in (("kind", "TEXT DEFAULT 'text'"), ("image", "BLOB")):
             if name not in columns:
@@ -51,6 +55,12 @@ class Store:
                 self.conn.execute(f"UPDATE {table} SET updated_at=(SELECT eaten_at FROM meals WHERE id={table}.meal)")
             if "updated_seq" not in columns:
                 self.conn.execute(f"ALTER TABLE {table} ADD COLUMN updated_seq INTEGER DEFAULT 0")
+            if "sent_at" not in columns:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN sent_at INTEGER")
+                if table == "photos":
+                    self.conn.execute("UPDATE photos SET sent_at=(SELECT original_at FROM meals WHERE id=photos.meal)")
+                else:
+                    self.conn.execute("UPDATE notes SET sent_at=updated_at")
         self.conn.commit()
 
     def close(self):
@@ -88,8 +98,8 @@ class Store:
         if existing:
             meal = existing["meal"]
         else:
-            self.conn.execute("""INSERT OR IGNORE INTO meals(identity,chat,source,eaten_at,ready)
-                              VALUES (?,?,?,?,?)""", (identity, chat, mid, msg["date"], ready))
+            self.conn.execute("""INSERT OR IGNORE INTO meals(identity,chat,source,eaten_at,ready,original_at)
+                              VALUES (?,?,?,?,?,?)""", (identity, chat, mid, msg["date"], ready, msg["date"]))
             meal = self.conn.execute("SELECT id FROM meals WHERE identity=?", (identity,)).fetchone()[0]
         version = msg.get("edit_date", msg["date"])
         if existing and edited:
@@ -101,8 +111,8 @@ class Store:
         elif existing:
             changed = False
         else:
-            self.conn.execute("INSERT INTO photos(chat,message,meal,file_id,caption,updated_at,updated_seq) VALUES (?,?,?,?,?,?,?)",
-                (chat, mid, meal, msg["photo"][-1]["file_id"], msg.get("caption", ""), version, sequence))
+            self.conn.execute("INSERT INTO photos(chat,message,meal,file_id,caption,updated_at,updated_seq,sent_at) VALUES (?,?,?,?,?,?,?,?)",
+                (chat, mid, meal, msg["photo"][-1]["file_id"], msg.get("caption", ""), version, sequence, msg["date"]))
             changed = True
         self.link(chat, mid, meal)
         if changed:
@@ -119,12 +129,12 @@ class Store:
     def add_text_meal(self, msg, body, now, edited=False, sequence=0):
         chat, mid = msg["chat"]["id"], msg["message_id"]
         with self.conn:
-            self.conn.execute("""INSERT OR IGNORE INTO meals(identity,chat,source,eaten_at,ready)
-                              VALUES (?,?,?,?,?)""",
-                              (f"{chat}:text:{mid}", chat, mid, msg["date"], now))
+            self.conn.execute("""INSERT OR IGNORE INTO meals(identity,chat,source,eaten_at,ready,original_at)
+                              VALUES (?,?,?,?,?,?)""",
+                              (f"{chat}:text:{mid}", chat, mid, msg["date"], now, msg["date"]))
             meal = self.text_meal(chat, mid)
             self.add_note(meal, mid, body, now, edited=edited,
-                          version=msg.get("edit_date", msg["date"]), sequence=sequence)
+                          version=msg.get("edit_date", msg["date"]), sequence=sequence, sent_at=msg["date"])
         return meal
 
     def link(self, chat, message, meal):
@@ -134,7 +144,7 @@ class Store:
         row = self.conn.execute("SELECT meal FROM links WHERE chat=? AND message=?", (chat, message)).fetchone()
         return row[0] if row else None
 
-    def add_note(self, meal, message, body, now, edited=False, version=None, sequence=0):
+    def add_note(self, meal, message, body, now, edited=False, version=None, sequence=0, sent_at=None):
         row = self.conn.execute("SELECT * FROM meals WHERE id=?", (meal,)).fetchone()
         chat = row["chat"]
         version = int(now) if version is None else version
@@ -145,14 +155,15 @@ class Store:
                 self.conn.execute("UPDATE notes SET body=?,updated_at=?,updated_seq=? WHERE chat=? AND message=?",
                                   (body, version, sequence, chat, message))
         else:
-            self.conn.execute("INSERT INTO notes(chat,message,meal,body,updated_at,updated_seq) VALUES (?,?,?,?,?,?)",
-                              (chat, message, meal, body, version, sequence))
+            self.conn.execute("INSERT INTO notes(chat,message,meal,body,updated_at,updated_seq,sent_at) VALUES (?,?,?,?,?,?,?)",
+                              (chat, message, meal, body, version, sequence, version if sent_at is None else sent_at))
             changed = True
         self.link(chat, message, meal)
         if changed:
             ready = max(now, row["ready"]) if ":album:" in row["identity"] and row["state"] == "pending" else now
             self.conn.execute("UPDATE meals SET state='pending',ready=?,attempts=0 WHERE id=?", (ready, meal))
         self.conn.commit()
+        return changed
 
     def photos(self, meal):
         return [dict(r) for r in self.conn.execute("SELECT * FROM photos WHERE meal=? ORDER BY message", (meal,))]
@@ -161,15 +172,15 @@ class Store:
         return [r[0] for r in self.conn.execute("SELECT body FROM notes WHERE meal=? ORDER BY updated_at,updated_seq,message", (meal,))]
 
     def evidence(self, meal):
-        captions = [{"kind": "caption", "body": row["caption"], "version": row["updated_at"], "sequence": row["updated_seq"]}
+        captions = [{"kind": "caption", "body": row["caption"], "version": row["updated_at"], "sequence": row["updated_seq"], "sent_at": row["sent_at"]}
                     for row in self.conn.execute("SELECT * FROM photos WHERE meal=? ORDER BY message", (meal,))]
-        notes = [{"kind": "correction", "body": row["body"], "version": row["updated_at"], "sequence": row["updated_seq"]}
+        notes = [{"kind": "correction", "body": row["body"], "version": row["updated_at"], "sequence": row["updated_seq"], "sent_at": row["sent_at"]}
                  for row in self.conn.execute("SELECT * FROM notes WHERE meal=? ORDER BY message", (meal,))]
         return sorted(captions + notes, key=lambda event: (event["version"], event["sequence"]))
 
     def latest_meal(self, chat, timestamp):
-        row = self.conn.execute("""SELECT id FROM meals WHERE chat=? AND eaten_at<=? AND eaten_at>=?
-                                  ORDER BY eaten_at DESC,source DESC LIMIT 1""",
+        row = self.conn.execute("""SELECT id FROM meals WHERE chat=? AND original_at<=? AND original_at>=?
+                                  ORDER BY original_at DESC,source DESC LIMIT 1""",
                                 (chat, timestamp, timestamp - 86400)).fetchone()
         return row[0] if row else None
 
@@ -178,12 +189,22 @@ class Store:
                                 (now,)).fetchone()
         return dict(row) if row else None
 
-    def finish(self, meal, assessment, text):
+    def finish(self, meal, assessment, text, eaten_at=None):
         with self.conn:
             row = self.conn.execute("SELECT * FROM meals WHERE id=?", (meal,)).fetchone()
-            self.conn.execute("UPDATE meals SET result=?,state=? WHERE id=?",
-                              (assessment.model_dump_json(), assessment.status, meal))
+            self.conn.execute("UPDATE meals SET result=?,state=?,eaten_at=? WHERE id=?",
+                              (assessment.model_dump_json(), assessment.status,
+                               row["eaten_at"] if eaten_at is None else eaten_at, meal))
             self.queue(row["chat"], row["source"], text, meal)
+
+    def time_error(self, meal, text, preserve_state=False):
+        with self.conn:
+            row = self.conn.execute("SELECT * FROM meals WHERE id=?", (meal,)).fetchone()
+            state = Assessment.model_validate_json(row["result"]).status if preserve_state and row["result"] else "error"
+            self.conn.execute("UPDATE meals SET state=? WHERE id=?", (state, meal))
+            self.queue(row["chat"], row["source"], text +
+                       " Предыдущая оценка и дата сохранены, если были. "
+                       "Исправь дату/время ответом на исходное сообщение еды или оценку.", meal)
 
     def fail(self, meal, now):
         with self.conn:
