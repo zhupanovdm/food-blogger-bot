@@ -31,6 +31,38 @@ class StoreTests(unittest.TestCase):
         self.db.close()
         self.tmp.cleanup()
 
+    def test_datetime_migration_preserves_old_records_and_is_repeatable(self):
+        meal = self.db.add_photo(photo(caption="вчера ужин"), now=0)
+        self.db.add_note(meal, 20, "вчера ужин", now=photo()["date"]+10)
+        self.db.finish(meal, result(), "text")
+        # Имитируем схему v1.1.0 без новых колонок времени.
+        with self.db.conn:
+            self.db.conn.execute("ALTER TABLE meals DROP COLUMN original_at")
+            self.db.conn.execute("ALTER TABLE photos DROP COLUMN sent_at")
+            self.db.conn.execute("ALTER TABLE notes DROP COLUMN sent_at")
+        previous = self.db.conn.execute("SELECT result FROM meals").fetchone()[0]
+        for _ in range(2):
+            self.db.close()
+            self.db = Store(self.path)
+            row = self.db.conn.execute("SELECT * FROM meals").fetchone()
+            self.assertEqual(row["eaten_at"], photo()["date"])
+            self.assertEqual(row["original_at"], photo()["date"])
+            self.assertEqual(row["result"], previous)
+            evidence = self.db.evidence(meal)
+            self.assertEqual([e["sent_at"] for e in evidence], [photo()["date"], photo()["date"]+10])
+
+    def test_explicit_note_sent_time_survives_edits_and_restart(self):
+        meal = self.db.add_photo(photo(), now=0)
+        sent = photo()["date"]+10
+        self.db.add_note(meal, 20, "вчера ужин", now=sent, sent_at=sent, version=sent)
+        self.db.add_note(meal, 20, "вчера обед", now=sent+86400, sent_at=sent,
+                         version=sent+86400, edited=True)
+        self.db.close()
+        self.db = Store(self.path)
+        event = self.db.evidence(meal)[-1]
+        self.assertEqual(event["sent_at"], sent)
+        self.assertEqual(event["version"], sent+86400)
+
     def test_duplicate_photo_not_counted_twice(self):
         a = self.db.add_photo(photo(), now=0)
         b = self.db.add_photo(photo(), now=1)
